@@ -66,8 +66,19 @@ private final class WebSocketHandler: ChannelInboundHandler {
         if var frameSequence = self.frameSequence, frame.fin {
             switch frameSequence.type {
             case .binary:
-                #warning("TODO: pass buffered results")
-            // webSocket.onBinaryCallback(webSocket, frameSequence.binaryBuffer?.readBytes(length: frameSequence.binaryBuffer?.readableBytes ?? 0) ?? [])
+                func _bytes() -> [UInt8] {
+                    guard var buffer = frameSequence.binaryBuffer else {
+                        return []
+                    }
+                    let length = buffer.readableBytes
+                    guard let bytes = buffer.readBytes(length: length) else {
+                        return []
+                    }
+                    return bytes
+                }
+                
+                let bytes = _bytes()
+                webSocket.onBinaryCallback(webSocket, bytes)
             case .text: webSocket.onTextCallback(webSocket, frameSequence.textBuffer)
             default: break
             }
