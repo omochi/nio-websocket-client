@@ -44,6 +44,7 @@ internal struct WebSocketFrameSequence {
 
     mutating func append(_ frame: WebSocketFrame) {
         var data = frame.unmaskedData
+        print("frame \(data.readableBytes)")
         switch type {
         case .binary:
             if var existing = self.binaryBuffer {

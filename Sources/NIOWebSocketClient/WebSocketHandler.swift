@@ -29,14 +29,21 @@ private final class WebSocketHandler: ChannelInboundHandler {
         var frame = self.unwrapInboundIn(data)
         switch frame.opcode {
         case .connectionClose:
+            print("close")
             self.receivedClose(context: context, frame: frame)
         case .ping:
+            print("ping")
             if !frame.fin {
                 closeOnError(context: context) // control frames can't be fragmented it should be final
             } else {
                 pong(context: context, frame: frame)
             }
         case .text, .binary:
+            if frame.opcode == .text {
+                print("text fin=\(frame.fin)")
+            } else {
+                print("bin fin=\(frame.fin)")
+            }
             // create a new frame sequence or use existing
             var frameSequence: WebSocketFrameSequence
             if let existing = self.frameSequence {
@@ -48,6 +55,7 @@ private final class WebSocketHandler: ChannelInboundHandler {
             frameSequence.append(frame)
             self.frameSequence = frameSequence
         case .continuation:
+            print("cont")
             // we must have an existing sequence
             if var frameSequence = self.frameSequence {
                 // append this frame and update
@@ -58,6 +66,7 @@ private final class WebSocketHandler: ChannelInboundHandler {
             }
         default:
             // We ignore all other frames.
+            print("ignored frame \(frame.opcode)")
             break
         }
 
@@ -66,8 +75,14 @@ private final class WebSocketHandler: ChannelInboundHandler {
         if var frameSequence = self.frameSequence, frame.fin {
             switch frameSequence.type {
             case .binary:
-                #warning("TODO: pass buffered results")
-            // webSocket.onBinaryCallback(webSocket, frameSequence.binaryBuffer?.readBytes(length: frameSequence.binaryBuffer?.readableBytes ?? 0) ?? [])
+                func _bytes() -> [UInt8] {
+                    guard var buffer = frameSequence.binaryBuffer else {
+                        return []
+                    }
+                    let length = buffer.readableBytes
+                    return buffer.readBytes(length: length) ?? []
+                }
+                webSocket.onBinaryCallback(webSocket, _bytes())
             case .text: webSocket.onTextCallback(webSocket, frameSequence.textBuffer)
             default: break
             }
