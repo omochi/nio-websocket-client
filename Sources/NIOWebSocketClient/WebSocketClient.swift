@@ -41,7 +41,8 @@ public final class WebSocketClient {
     let group: EventLoopGroup
     let configuration: Configuration
     let isShutdown = Atomic<Bool>(value: false)
-
+    var webSocket: Socket?
+    
     public init(eventLoopGroupProvider: EventLoopGroupProvider, configuration: Configuration = .init()) {
         self.eventLoopGroupProvider = eventLoopGroupProvider
         switch self.eventLoopGroupProvider {
@@ -66,21 +67,24 @@ public final class WebSocketClient {
             .channelInitializer { channel in
                 let httpEncoder = HTTPRequestEncoder()
                 let httpDecoder = ByteToMessageHandler(HTTPResponseDecoder(leftOverBytesStrategy: .forwardBytes))
+                
                 let webSocketUpgrader = WebSocketClientUpgradeHandler(
                     configuration: self.configuration,
                     host: host,
                     uri: uri,
-                    upgradePromise: upgradePromise
-                ) { channel, response in
-                    let webSocket = Socket(channel: channel)
-                    return channel.pipeline.removeHandler(httpEncoder).flatMap {
-                        return channel.pipeline.removeHandler(httpDecoder)
-                    }.flatMap {
-                        return channel.pipeline.addWebSocket(webSocket)
-                    }.map {
-                        onUpgrade(webSocket)
-                    }
-                }
+                    upgradePromise: upgradePromise,
+                    upgradePipelineHandler: { (channel, response) -> EventLoopFuture<Void> in
+                        self.webSocket = Socket(channel: channel)
+                        
+                        return channel.pipeline.removeHandler(httpEncoder).flatMap {
+                            return channel.pipeline.removeHandler(httpDecoder)
+                        }.flatMap {
+                            return channel.pipeline.addWebSocket(self.webSocket!)
+                        }
+                    },
+                    upgradeCompleteHandler: { () in
+                        onUpgrade(self.webSocket!)
+                    })
                 var handlers: [ChannelHandler] = []
                 if let tlsConfiguration = self.configuration.tlsConfiguration {
                     let context = try! NIOSSLContext(configuration: tlsConfiguration)
@@ -132,10 +136,13 @@ internal final class WebSocketClientUpgradeHandler: ChannelInboundHandler, Remov
     private let uri: String
     private let upgradePromise: EventLoopPromise<Void>
     private let upgradePipelineHandler: (Channel, HTTPResponseHead) -> EventLoopFuture<Void>
+    private let upgradeCompleteHandler: () -> Void
+    private var receivedContents: [NIOAny] = []
 
     private enum State {
         case ready
         case awaitingResponseEnd(HTTPResponseHead)
+        case capturingContents
     }
 
     private var state: State
@@ -145,17 +152,27 @@ internal final class WebSocketClientUpgradeHandler: ChannelInboundHandler, Remov
         host: String,
         uri: String,
         upgradePromise: EventLoopPromise<Void>,
-        upgradePipelineHandler: @escaping (Channel, HTTPResponseHead) -> EventLoopFuture<Void>
+        upgradePipelineHandler: @escaping (Channel, HTTPResponseHead) -> EventLoopFuture<Void>,
+        upgradeCompleteHandler: @escaping () -> Void
     ) {
         self.configuration = configuration
         self.host = host
         self.uri = uri
         self.upgradePromise = upgradePromise
         self.upgradePipelineHandler = upgradePipelineHandler
+        self.upgradeCompleteHandler = upgradeCompleteHandler
         self.state = .ready
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        switch state {
+        case .capturingContents:
+            receivedContents.append(data)
+            return
+        case .ready, .awaitingResponseEnd:
+            break
+        }
+        
         let response = self.unwrapInboundIn(data)
         switch response {
         case .head(let head):
@@ -166,8 +183,9 @@ internal final class WebSocketClientUpgradeHandler: ChannelInboundHandler, Remov
         case .end:
             switch self.state {
             case .awaitingResponseEnd(let head):
+                self.state = .capturingContents
                 self.upgrade(context: context, upgradeResponse: head).cascade(to: self.upgradePromise)
-            case .ready:
+            case .ready, .capturingContents:
                 fatalError("Invalid response state")
             }
         }
@@ -214,9 +232,19 @@ internal final class WebSocketClientUpgradeHandler: ChannelInboundHandler, Remov
             WebSocketFrameEncoder(),
             ByteToMessageHandler(WebSocketFrameDecoder(maxFrameSize: self.configuration.maxFrameSize))
         ]).flatMap {
-            return context.pipeline.removeHandler(self)
-        }.flatMap {
             return self.upgradePipelineHandler(context.channel, upgradeResponse)
+        }.flatMap {
+            self.upgradeCompleteHandler()
+            
+            if !self.receivedContents.isEmpty {
+                while !self.receivedContents.isEmpty {
+                    let content = self.receivedContents.removeFirst()
+                    context.fireChannelRead(content)
+                }
+                context.fireChannelReadComplete()
+            }
+            
+            return context.pipeline.removeHandler(self)
         }
     }
 }
